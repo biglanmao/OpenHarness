@@ -26,6 +26,28 @@ class McpServerNotConnectedError(Exception):
     """Raised when an MCP server is not connected or its session has been lost."""
 
 
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """Read an SDK model field across mcp major versions.
+
+    The mcp SDK renamed its camelCase model fields to snake_case in 2.0
+    (``inputSchema`` -> ``input_schema``), so both spellings are accepted.
+    """
+    if obj is None:
+        return default
+    for candidate in (name, name + "_", name.replace("_", "")):
+        if hasattr(obj, candidate):
+            return getattr(obj, candidate)
+    for key in (name, _to_camel(name)):
+        if isinstance(obj, dict) and key in obj:
+            return obj[key]
+    return default
+
+
+def _to_camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(part.capitalize() for part in rest)
+
+
 class McpClientManager:
     """Manage MCP connections and expose tools/resources."""
 
@@ -147,8 +169,9 @@ class McpClientManager:
                 parts.append(getattr(item, "text", ""))
             else:
                 parts.append(item.model_dump_json())
-        if result.structuredContent and not parts:
-            parts.append(str(result.structuredContent))
+        structured = _field(result, "structured_content")
+        if structured and not parts:
+            parts.append(str(structured))
         if not parts:
             parts.append("(no output)")
         return "\n".join(parts).strip()
@@ -221,9 +244,11 @@ class McpClientManager:
             http_client = await stack.enter_async_context(
                 httpx.AsyncClient(headers=config.headers or None)
             )
-            read_stream, write_stream, _get_session_id = await stack.enter_async_context(
+            streams = await stack.enter_async_context(
                 streamable_http_client(config.url, http_client=http_client)
             )
+            # mcp < 2 yields (read, write, get_session_id); mcp >= 2 yields (read, write).
+            read_stream, write_stream = streams[0], streams[1]
             await self._register_connected_session(
                 name=name,
                 config=config,
@@ -273,7 +298,9 @@ class McpClientManager:
                 server_name=name,
                 name=tool.name,
                 description=tool.description or "",
-                input_schema=dict(tool.inputSchema or {"type": "object", "properties": {}}),
+                input_schema=dict(
+                    _field(tool, "input_schema") or {"type": "object", "properties": {}}
+                ),
             )
             for tool in tool_result.tools
         ]
